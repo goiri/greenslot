@@ -1,0 +1,39 @@
+Daemon: gslurmd
+	This is the daemon that runs GreenSlot.
+
+Core: gslurm.py
+	This is the core for GreenSlot.
+	It includes:
+		- Energy scheduling
+		- Job and workflow management
+
+Main configuration: gslurmcommons.py
+	This is the main file for configuration.
+
+Schedulers:
+	gslurm-formerworkflow.py
+	gslurm-outwindowall.py
+	gslurm-outwindow.py
+	gslurm-inwindow.py
+	gslurm-outwindoweverything.py
+	
+Solar prediction: greenavailability/
+	It can be found in GreenHadoop.
+	https://github.com/goiri/greenhadoop/tree/master/greenavailability
+
+Auxiliary components:
+	gslurmworkflow.py: helps setting the deadlines.
+	gsbatch: submit a job.
+	setclock: setting the clock for every node.
+
+Experiments:
+	experimenter.sh: script to start all the set of experiments.
+	gslurmcleaner.py: cancel all jobs
+	gslurmstart.py: cancel all jobs
+	gslurmparser.py: parse the GreenSlot outputs.
+	gslurmparserpeak.py: parse the GreenSlot outputs.
+	gslurmparserhtml.py: parse the GreenSlot outputs.
+	tester.py: some testing
+
+More information:
+	http://www.cs.rutgers.edu/~ricardob/papers/sc11a.pdf

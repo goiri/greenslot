@@ -1,0 +1,635 @@
+#!/usr/bin/python
+
+"""
+GreenSlot makes SLURM aware of solar energy availability.
+http://www.research.rutgers.edu/~goiri/
+Copyright (C) 2012 Inigo Goiri, Rutgers University
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>
+"""
+
+import time
+from datetime import datetime,timedelta
+
+from optparse import OptionParser
+
+from gslurmcommons import *
+from gslurm import *
+from gslurmworkflow import *
+
+import sys
+sys.path.append(r'greenavailability/')
+import model,setenv
+
+setenv.init()
+
+
+
+# Extra functions
+# Get the available green power
+def readGreenAvailFile(filename):
+	greenAvailability = []
+	file = open(filename, 'r')
+	for line in file:
+		if line != '' and line.find("#")!=0 and line != '\n':
+			lineSplit = line.strip().expandtabs(1).split(' ')
+			t=lineSplit[0]
+			p=float(lineSplit[1])
+			greenAvailability.append(TimeValue(t,p))
+	file.close()
+	return greenAvailability
+
+# Get the cost of the brown energy
+def readBrownPriceFile(filename):
+	brownPrice = []
+	file = open(filename, 'r')
+	for line in file:
+		if line != '' and line != '\n' and line.find("#")!=0:
+			lineSplit = line.strip().expandtabs(1).split(' ')
+			t=lineSplit[0]
+			p=float(lineSplit[1])
+			brownPrice.append(TimeValue(t,p))
+	file.close()
+	return brownPrice
+
+# Write a line in a log
+openLogs = {}
+def writeLog(filename, txt):
+	if filename not in openLogs:
+		file = open(filename, 'a')
+		openLogs[filename] = file
+	else:
+		file = openLogs[filename]
+	file.write(txt+"\n")
+
+def closeLogs():
+	for filename in openLogs:
+		file = openLogs[filename]
+		file.close()
+
+# Read workload file
+def readWorkload(filename):
+	workload = []
+	if filename != None:
+		file = open(filename, 'r')
+		for line in file:
+			if line != '' and line != '\n' and line.find("#")!=0:
+				lineSplit = line.strip().expandtabs(1).split(' ')
+				# Treat date
+				lineSplit[0] = parseTime(lineSplit[0])
+				workload.append(lineSplit)
+	return sorted(workload)
+
+def submitWorkload(workload):
+	done = False
+	firstJobId = None
+	while len(workload)>0 and parseTime(workload[0][0])<=timeElapsed:
+		cmd = workload[0][5]
+		for i in range(6,len(workload[0])):
+			cmd+=" "+workload[0][i]
+		runtime = parseTime(workload[0][1])
+		userruntime = parseTime(workload[0][2])
+		deadline = parseTime(workload[0][3])
+		nodes = int(workload[0][4])
+		if cmd.find("workflow")>=0:
+			fileOut = open("/tmp/gslurm", 'a')
+			workflow = readWorkflow("workload/"+cmd, deadline)
+			workflowId = None
+			workflowIds = {}
+			for work in workflow:
+				# Submit
+				jobId = submitJob(work.cmd, work.runtime, work.userruntime, work.deadline, work.nodes)
+				if firstJobId == None:
+					firstJobId = jobId
+				if workflowId == None:
+					workflowId = jobId
+				workflowIds[work.id] = jobId
+				# Store workflow info
+				pre = ""
+				if len(work.pre)>0:
+					for workPre in work.pre:
+						pre+=" "+str(workflowIds[workPre])
+				fileOut.write("workflow "+str(jobId)+" "+str(workflowId)+pre+"\n")
+		else:
+			if userruntime<deadline:
+				jobId = submitJob(cmd, runtime, userruntime, deadline, nodes)
+				if firstJobId == None:
+					firstJobId = jobId
+			else:
+				writeLog("logs/gslurm-jobs.log", "%d\t%s\t%s\t%d\t%d\t%d\t%d\tCancel" % (timeElapsed, "x", "-", timeElapsed, nodes, runtime, deadline))
+		workload.pop(0)
+	return firstJobId
+
+def numScheduledJobs(sched):
+	ret = 0
+	if sched != None:
+		for i in range(0, len(sched)):
+			ret += len(sched[i])
+	return ret
+	
+	
+def numJobs():
+	ret = 0
+	jobs = getJobsFast()
+	if jobs != None:
+		for job in jobs.values():
+			ret += 1
+			if job.state=="COMPLETED" or job.state.startswith("CANCEL"):
+				ret -= 1
+	return ret
+
+def timeLimit(timeElapsed):
+	ret = True
+	if TIME_LIMIT != None:
+		if timeElapsed < TIME_LIMIT:
+			ret = False
+	return ret
+
+# Start daemon...
+# Parse parameters
+parser = OptionParser()
+#parser.add_option("-g", "--greenfile", dest="greenFile", help="specify green availability file", type="string", default=GREEN_AVAILABILITY_FILE)
+parser.add_option("-w", "--workload", dest="workloadFile", help="specify workload file", type="string", default=WORKLOAD_FILE)
+parser.add_option("-b", "--brownfile", dest="brownFile", help="specify brown price file", type="string", default=BROWN_PRICE_FILE)
+parser.add_option("-d", "--date", dest="date", help="specify date", type="string", default=None)
+parser.add_option("--pred", dest="predGreen", help="specify if the scheduler use green availability predictions", type="int", default=None)
+parser.add_option("--green", action="store_true", dest="schedGreen", help="specify if the scheduler supports green availability")
+parser.add_option("--brown", action="store_true", dest="schedBrown", help="specify if the scheduler supports brown pricing")
+parser.add_option("--reverse", action="store_true", dest="schedReverse", help="specify if the scheduler perfoms a reverse scheduling")
+parser.add_option("--peak", dest="peakCost",  type="float", help="specify if the scheduler supports brown pricing", default=None)
+
+(options, args) = parser.parse_args()
+workloadFile = options.workloadFile
+brownPriceFile = options.brownFile
+if options.date == None:
+	baseDate = BASE_DATE
+elif options.date == "-":
+	baseDate = BASE_DATE
+else:
+	baseDate = datetime.strptime(options.date, "%Y-%m-%dT%H:%M:%S")
+
+# Show starting info
+print "Date:        "+str(baseDate)
+if options.date == "-":
+	print "No energy"
+print "Max time:    "+toTimeString(TOTALTIME)
+print "Slot length: "+toTimeString(SLOTLENGTH)
+print "Slots:       "+str(numSlots)
+print "Workload:    "+str(workloadFile)
+print "Brown price: "+str(brownPriceFile)
+
+
+# Predictor
+if options.predGreen != None:
+	#ep = model.EnergyPredictor('./greenavailability', 2, MAX_POWER) # Threshold = 2hour; Capacity=2000W
+	#ep = model.CachedEnergyPredictor(baseDate, predictionHorizon=48,path='./greenavailability', threshold=2, scalingFactor=MAX_POWER) # Threshold = 2hour; Capacity=2037W
+	#ep = model.CachedEnergyPredictor(baseDate, predictionHorizon=48, path='./greenavailability', threshold=2, scalingFactor=MAX_POWER, useActualData=True, error_exit=model.enter_on_thresh)
+	ep = model.CachedEnergyPredictor(baseDate, predictionHorizon=48, path='./greenavailability', threshold=2, scalingFactor=MAX_POWER, useActualData=True, error_exit=options.predGreen)
+	#model.enter_on_thresh
+	print "Getting predictions... done!"
+
+# First job id
+firstJobId = None
+
+# Starting...
+timeStart = datetime.now()
+timeStart = datetime(timeStart.year, timeStart.month, timeStart.day, timeStart.hour, timeStart.minute, timeStart.second)
+
+loggedJob = []
+totalEnergy = 0.0
+greenTotalEnergy = 0
+brownTotalEnergy = 0
+
+# Jobs
+finishedJobs = {}
+
+# Read green availability and brown cost
+#if greenAvailabilityFile != None:
+	#actualGreenAvail = readGreenAvailFile(greenAvailabilityFile)
+if options.date == "-":
+	greenAvail = readGreenAvailFile("data/greenpower.none")
+else:
+	greenAvail = readGreenAvailFile("data/solarpower-%02d-%02d-%02d" % (baseDate.day, baseDate.month, baseDate.year))
+brownPrice = readBrownPriceFile(brownPriceFile)
+
+# Read workload
+workload = readWorkload(workloadFile)
+
+# Initialize matrices
+timeArray = []
+greenAvailArray = []
+greenPrediArray = []
+brownPriceArray = []
+for i in range(0, numSlots):
+	timeArray.append(0)
+	greenAvailArray.append(0)
+	greenPrediArray.append(0)
+	brownPriceArray.append(0.0)
+prepone = {}
+pospone = {}
+
+# Write log headers
+writeLog("logs/gslurm-jobs.log", "# "+str(timeStart)+" Workload="+str(workloadFile)+" Speedup="+str(SPEEDUP)+" SlotLength="+str(SLOTLENGTH)+" TotalTime="+str(TOTALTIME)+" SchedEvent="+str(SCHEDULE_EVENT)+" SchedSlot="+str(SCHEDULE_SLOT)+" WorkloadGen="+str(WORKLOADGEN))
+writeLog("logs/gslurm-jobs.log", "# t\tid\twork\tsubmit\tstart\tend\tnodes\tuserRun\tuserDL\twait\trun\ttotal\tsurplusDL\tPrepone\tPospone")
+
+# Energy headers
+writeLog("logs/gslurm-energy.log", "# set style fill solid")
+writeLog("logs/gslurm-energy.log", "# plot \"testenergy\" using 1:7 lc rgb \"brown\" w boxes title \"Brown\", \"testenergy\" using 1:5 lc rgb \"green\" w boxes title \"Green\", \"testenergy\" using 1:2 w steps lw 3 lc rgb \"blue\" title \"Green availability\"")
+
+writeLog("logs/gslurm-energy.log", "# "+str(timeStart)+" Workload="+str(workloadFile)+" Date="+str(baseDate)+" BrownPrice="+str(brownPriceFile)+" Speedup="+str(SPEEDUP)+" SlotLength="+str(SLOTLENGTH)+" TotalTime="+str(TOTALTIME)+" SchedEvent="+str(SCHEDULE_EVENT)+" SchedSlot="+str(SCHEDULE_SLOT)+" WorkloadGen="+str(WORKLOADGEN)+" SchedGreen="+str(SCHEDULE_GREEN)+" SchedBrownPrice="+str(SCHEDULE_BROWN_PRICE)+" SchedBrownPeak="+str(SCHEDULE_BROWN_PEAK))
+writeLog("logs/gslurm-energy.log", "# t\tgreen\tpredi\tbrown\tnodes\tgreenUse\tbrownUse\ttotalUse")
+writeLog("logs/gslurm-energy.log", "0\t0\t0\t0\t0\t0\t0\t0")
+
+# Scheduler headers
+writeLog("logs/gslurm-scheduler.log", "# Time")
+
+schedCycle = True
+sched = None
+notScheduled = []
+peakBrown = 0
+
+
+# Do a cycle while there is something to execute
+timeElapsed = 0
+lastPercentageLog = datetime.now()
+#while len(workload)>0 or numJobs()>0 or not timeLimit(timeElapsed):
+#while len(workload)>0 or numJobs()>0 or not timeLimit(timeElapsed):
+while not timeLimit(timeElapsed):
+	# Compute where we are
+	timeCycle = datetime.now()
+	timeSchedule = 0
+	timeNow = timeCycle
+	timeNow = datetime(timeNow.year, timeNow.month, timeNow.day, timeNow.hour, timeNow.minute, timeNow.second)
+	timeElapsed = toSeconds(timeNow-timeStart)*SPEEDUP
+	dateCurrent = baseDate + timedelta(seconds=timeElapsed)
+	slotCurrent = int(math.floor(1.0*timeElapsed/SLOTLENGTH))
+
+	# Report percentage every 15 minutes
+	if (timeCycle-lastPercentageLog) > timedelta(seconds=15*60):
+		print "%.1f%%" % (100.0*100.0*toSeconds(timeNow-timeStart)/TIME_LIMIT)
+		lastPercentageLog = timeCycle
+
+	if DEBUG>0 and (schedCycle or SCHEDULE_SLOT):
+		clearscreen()
+		band=""
+		for i in range(0, 80):
+			band+="="
+		print bcolors.WHITEBG+"==="+bcolors.ENDC+"Date: "+str(dateCurrent)+"  Time: "+toTimeString(timeElapsed)+" (x"+str(SPEEDUP)+") "+bcolors.WHITEBG+band+bcolors.ENDC
+		if SPEEDUP >= SLOTLENGTH:
+			print "Too fast for SLURM..."
+	elif DEBUG>0:
+		print "Date: "+str(dateCurrent)+"  Time: "+toTimeString(timeElapsed)
+	
+	# Compute inputs: green availability and brown costW
+	# Get data from forecasts
+	#if greenAvailabilityFile == None:
+	if options.predGreen != None:
+		date = baseDate + timedelta(seconds=timeElapsed)
+		prediction, flag = ep.getGreenAvailability(date, TOTALTIME/3600) # 48h
+		
+		# Manage data: put it in the green availability matrix
+		greenPredi = []
+		for i in range(0, len(prediction)):
+			d = date + timedelta(hours=i)
+			if i>0:
+				d = datetime(d.year, d.month, d.day, d.hour)
+			t = toSeconds(d-date) + timeElapsed
+			value = prediction[i]
+			greenPredi.append(TimeValue(t, value))
+	else:
+		greenPredi = greenAvail
+
+	# Process input information: green and brown energy
+	jG1 = jP1 = jB1 = 0
+	jG2 = jP2 = jB2 = 0
+	for i in range(0, numSlots):
+		start = i*SLOTLENGTH + timeElapsed
+		end = (i+1)*SLOTLENGTH + timeElapsed
+		timeArray[i] = i*SLOTLENGTH + timeElapsed
+		
+		# Green prediction: estimate average energy available
+		while jP1+1 < len(greenPredi) and (greenPredi[jP1+1].t) <= start:
+			jP1+=1
+		while jP2+1 < len(greenPredi) and (greenPredi[jP2+1].t) <= end:
+			jP2+=1
+		if start>=greenPredi[jP2].t:
+			greenPrediArray[i] = greenPredi[jP2].v
+		else:
+			greenV = 0.0
+			for j in range(jP1, jP2+1):
+				j1 = greenPredi[j].t
+				j2 = greenPredi[j].t
+				if j+1 < len(greenPredi):
+					j2 = greenPredi[j+1].t
+				if j2 > end:
+					j2 = end
+				if j1 > end:
+					j1 = end
+				if j1 < start:
+					j1 = start
+				greenV += (greenPredi[j].v)*(j2-j1)
+			greenPrediArray[i] = greenV/SLOTLENGTH
+		
+		# Green availability: estimate average energy available
+		while jG1+1 < len(greenAvail) and (greenAvail[jG1+1].t) <= start:
+			jG1+=1
+		while jG2+1 < len(greenAvail) and (greenAvail[jG2+1].t) <= end:
+			jG2+=1
+		if start>=greenAvail[jG2].t:
+			greenAvailArray[i] = greenAvail[jG2].v
+		else:
+			greenV = 0.0
+			for j in range(jG1, jG2+1):
+				j1 = greenAvail[j].t
+				j2 = greenAvail[j].t
+				if j+1 < len(greenAvail):
+					j2 = greenAvail[j+1].t
+				if j2 > end:
+					j2 = end
+				if j1 > end:
+					j1 = end
+				if j1 < start:
+					j1 = start
+				greenV += (greenAvail[j].v)*(j2-j1)
+			greenAvailArray[i] = greenV/SLOTLENGTH
+		
+		# Use actual value
+		greenPrediArray[0] = greenAvailArray[0]
+		
+		# Brown: current price
+		while jB1+1 < len(brownPrice) and (brownPrice[jB1+1].t) <= start:
+			jB1+=1
+		brownPriceArray[i] = brownPrice[jB1].v
+
+	if DEBUG >=3:
+		print "Green energy available:"
+		max = len(getNodes()) * Node.POWER_FULL
+		for i in range(MAXSIZE,0,-1):
+			out=""
+			for v in greenAvailArray:
+				if v > (1.0*(i-1)*max/MAXSIZE):
+					out += bcolors.GREENBG+" "+bcolors.ENDC
+				else:
+					out += " "
+			print out+" "+str(1.0*i*max/MAXSIZE)+"W"
+			
+		print "Green energy predicted:"
+		max = len(getNodes()) * Node.POWER_FULL
+		for i in range(MAXSIZE,0,-1):
+			out=""
+			for v in greenPrediArray:
+				if v > (1.0*(i-1)*max/MAXSIZE):
+					out += bcolors.GREENBG+" "+bcolors.ENDC
+				else:
+					out += " "
+			print out+" "+str(1.0*i*max/MAXSIZE)+"W"
+			
+	# Submit jobs
+	if WORKLOADGEN:
+		workloadId = submitWorkload(workload)
+		if workloadId != None:
+			if firstJobId == None:
+				firstJobId = workloadId
+			schedCycle = True
+
+	# Schedule jobs
+	if schedCycle or SCHEDULE_SLOT or len(notScheduled)>0:
+		# Store previous schedule
+		prevSched = sched
+		
+		# Perform scheduling
+		timeSchedule = datetime.now()
+		sched,schedArray,notScheduled = schedule(dateCurrent, timeElapsed, peakBrown, greenPrediArray, brownPriceArray, options)
+		timeSchedule = datetime.now() - timeSchedule		
+
+		# Check changes in scheduling
+		if prevSched != None:
+			for pos in range(0, len(sched)):
+				for job1 in sched[pos]:
+					for pre in range(0, len(prevSched)):
+						for job2 in prevSched[pre]:
+							if job1.id == job2.id:
+								if (pre-1)<pos:
+									aux = 0
+									if job1.id in pospone:
+										aux = pospone[job1.id]
+									pospone[job1.id] = aux+1
+								elif (pre-1)>pos:
+									aux = 0
+									if job1.id in prepone:
+										aux = prepone[job1.id]
+									prepone[job1.id] = aux+1
+		
+		# Dispatch actions
+		done = dispatch(sched, schedArray)
+		if done:
+			schedCycle = True
+		else:
+			schedCycle = False
+	else:
+		# Shift schedule
+		for i in range(0,numSlots-1):
+			sched[i] = sched[i+1]
+			schedArray[i] = schedArray[i+1]
+		sched[numSlots-1] = []
+				
+		# Dispatch actions
+		done = dispatch(sched, schedArray)
+		if done:
+			schedCycle = True
+		else:
+			schedCycle = False
+	
+	# Report
+	reqPower = 0
+	# Jobs
+	for job in getJobs().values():
+		#finishedJobs[job.id] = job
+		if job.state == 'RUNNING':
+			reqPower += job.nodes * (getJobPower(job.cmd) - Node.POWER_S3)
+	
+	# Nodes
+	onNodes = 0
+	idleNodes = 0
+	for up in getNodes().values():
+		if up == False:
+			idleNodes+=1
+		if up != None and up != False:
+			onNodes+=1
+			
+	# Calculate used energy and power
+	greenEnergyAvail = greenAvailArray[0] # Wh
+	greenEnergyPredi = greenPrediArray[4] # Wh
+	#greenEnergyPredi = greenPredi[1].v
+	brownEnergyPrice = brownPriceArray[0] # $/KWh
+	
+	reqPower += (idleNodes+onNodes)*Node.POWER_S3 + POWER_IDLE_GSLURM
+	greenReqPower = 0
+	brownReqPower = 0
+	if reqPower>0:
+		greenPowerAvail = greenEnergyAvail
+		if reqPower>greenEnergyAvail:
+			greenReqPower = greenPowerAvail
+			brownReqPower = reqPower-greenEnergyAvail
+		else:
+			greenReqPower = reqPower
+	writeLog("logs/gslurm-energy.log", "%d\t%.2f\t%.2f\t%.5f\t%d\t%.2f\t%.2f\t%.2f" % (timeElapsed, greenEnergyAvail, greenEnergyPredi, brownEnergyPrice, onNodes, greenReqPower, brownReqPower, reqPower))
+
+	# Update peak power
+	if brownReqPower > peakBrown:
+		#print "NEW PEAK POWER "+str(brownReqPower)+" (prev="+str(peakBrown)+")"
+		peakBrown = brownReqPower
+
+	timeCycle = datetime.now() - timeCycle
+	writeLog("logs/gslurm-scheduler.log", str(timeElapsed)+"\t"+str(timeCycle)+"\t"+str(timeSchedule))
+
+	# Wait for next cycle: next slot or event
+	wait = True
+	while wait:
+		# Store jobs info
+		running = 0
+		pending = 0
+		completed = 0
+		for job in getJobsFast().values():
+			if job.state == 'RUNNING':
+				running += 1
+			elif job.state == 'PENDING':
+				pending += 1
+			elif job.state == 'COMPLETED':
+				completed -= 1
+		
+		# Wait 200 ms
+		time.sleep(0.2)
+		
+		# Update one an event happen
+		for job in getJobs().values():
+			finishedJobs[job.id] = job
+			if job.state == 'RUNNING':
+				running -= 1
+			elif job.state == 'PENDING':
+				pending -= 1
+			elif job.state == 'COMPLETED':
+				completed -= 1
+		for job in finishedJobs.values():
+			if job.id not in loggedJob:
+				if job.state == 'COMPLETED' and toSeconds(job.submit-timeStart)>=0:
+					# Pre pospone stats
+					auxPos = 0
+					if job.id in pospone:
+						auxPos = pospone[job.id]
+					auxPre = 0
+					if job.id in prepone:
+						auxPre = prepone[job.id]
+					# Job info
+					t = timeElapsed
+					id = str(int(job.id)-int(firstJobId))
+					work = -1
+					if job.workflow != "-":
+						work = str(int(job.workflow)-int(firstJobId))
+					submit = toSeconds(job.submit-timeStart)*SPEEDUP
+					start = toSeconds(job.start-timeStart)*SPEEDUP
+					end = toSeconds(job.end-timeStart)*SPEEDUP
+					nodes = job.nodes
+					userRuntime = job.runtime
+					userDeadline = job.deadline
+					waittime = toSeconds(job.start-job.submit)*SPEEDUP
+					runtime = toSeconds(job.end-job.start)*SPEEDUP
+					totaltime = toSeconds(job.end-job.submit)*SPEEDUP
+					surplusDeadline = toSeconds((job.submit+timedelta(seconds=(job.deadline/SPEEDUP)))-job.end)*SPEEDUP
+					if runtime>userRuntime:
+						surplusDeadline += (runtime-userRuntime)
+					# Save job info
+					writeLog("logs/gslurm-jobs.log", "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d" % (t, id, work, submit, start, end, nodes, userRuntime, userDeadline, waittime, runtime, totaltime, surplusDeadline, auxPre, auxPos))
+					
+					# Power info
+					# TODO
+					# S3 + (Power-S3)
+					# -Power + IDLE => IDLE
+					reqPower -= job.nodes * (getJobPower(job.cmd) - Node.POWER_IDLE)
+					greenReqPower = 0
+					brownReqPower = 0
+					if reqPower>0:
+						greenPowerAvail = greenEnergyAvail
+						if reqPower>greenEnergyAvail:
+							greenReqPower = greenPowerAvail
+							brownReqPower = reqPower-greenEnergyAvail
+						else:
+							greenReqPower = reqPower
+					# Save power info
+					writeLog("logs/gslurm-energy.log", "%d\t%.2f\t%.2f\t%.5f\t%d\t%.2f\t%.2f\t%.2f" % (timeElapsed, greenEnergyAvail, greenEnergyPredi, brownEnergyPrice, onNodes, greenReqPower, brownReqPower, reqPower))
+
+					# Logged
+					loggedJob.append(job.id)
+				elif job.state == 'CANCELLED':
+					# t
+					# id
+					if toSeconds(job.submit-timeStart)*SPEEDUP>=0:
+						id = str(int(job.id)-int(firstJobId))
+						work = str(int(job.workflow)-int(firstJobId))
+						submit = toSeconds(job.submit-timeStart)*SPEEDUP
+						start = -1
+						end = -1
+						writeLog("logs/gslurm-jobs.log", "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\tCancel" % (timeElapsed, id, work, submit, start, end, job.nodes, job.runtime, job.deadline))
+						loggedJob.append(job.id)
+				elif job.state == 'FAILED':
+					# t
+					# id
+					id = str(int(job.id)-int(firstJobId))
+					work = str(int(job.workflow)-int(firstJobId))
+					submit = toSeconds(job.submit-timeStart)*SPEEDUP
+					start = -1
+					end = -1
+					writeLog("logs/gslurm-jobs.log", "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\tFailed" % (timeElapsed, id, work, submit, start, end, job.nodes, job.runtime, job.deadline))
+					loggedJob.append(job.id)
+				
+				
+		if running!=0 or pending!=0:
+			schedCycle = True
+			if SCHEDULE_EVENT:
+				wait = False
+		
+		# Check if there are changes for the next slot
+		if len(sched[1])>0 or schedArray[0]!=schedArray[1]:
+			schedCycle = True
+			
+		# Update every slot
+		if CYCLE_SLOT:
+			# Update time
+			auxNow = datetime.now()
+			auxNow = datetime(auxNow.year, auxNow.month, auxNow.day, auxNow.hour, auxNow.minute, auxNow.second)
+			timeElapsed = toSeconds(auxNow-timeStart)*SPEEDUP
+			
+			# Next slot?
+			if timeElapsed >= (slotCurrent+1)*SLOTLENGTH:
+				wait = False
+			
+		# Jobs in the queue?
+		if WORKLOADGEN:
+			workloadId = submitWorkload(workload)
+			if workloadId != None:
+				schedCycle = True
+				if firstJobId == None:
+					firstJobId = workloadId
+				if SCHEDULE_EVENT:
+					wait = False
+
+
+writeLog("logs/gslurm-energy.log", str(timeElapsed)+"\t0\t0\t0\t0\t0\t0\t0")
+closeLogs()
+
+# Compute final time
+timeNow = datetime.now()
+timeNow = datetime(timeNow.year, timeNow.month, timeNow.day, timeNow.hour, timeNow.minute, timeNow.second)
+timeElapsed = toSeconds(timeNow-timeStart)
+print "Total experiment time: "+toTimeString(timeElapsed)

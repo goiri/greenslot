@@ -1,4 +1,0 @@
-greenslot
-=========
-
-GreenSlot
