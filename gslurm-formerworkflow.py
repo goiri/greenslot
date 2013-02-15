@@ -3,7 +3,8 @@
 """
 GreenSlot makes SLURM aware of solar energy availability.
 http://www.research.rutgers.edu/~goiri/
-Copyright (C) 2012 Inigo Goiri, Rutgers University
+Copyright (C) 2012 Inigo Goiri and Ricardo Bianchini.
+All rights reserved. Dept. of Computer Science, Rutgers University.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
